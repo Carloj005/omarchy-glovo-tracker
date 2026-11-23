@@ -38,6 +38,7 @@ Panel {
   property bool fetching: false
   property bool browserSyncing: false
   property bool loginInProgress: false
+  property bool logoutInProgress: false
   property string lastError: ""
   property bool hasAuthToken: false
   property bool fluxConnected: false
@@ -1019,6 +1020,7 @@ Panel {
                     spacing: Style.space(6)
 
                     Button {
+                      enabled: !root.logoutInProgress
                       text: root.loginInProgress ? strings.t("browser.loggingIn") : strings.t("browser.loginButton")
                       iconText: "\uf090"
                       foreground: root.contentForeground
@@ -1032,6 +1034,7 @@ Panel {
 
                     Button {
                       visible: !!(root.sessionState && root.sessionState.loggedIn)
+                      enabled: !root.logoutInProgress
                       text: strings.t("browser.syncNowButton")
                       iconText: "\uf021"
                       iconSpinning: root.browserSyncing
@@ -1044,8 +1047,9 @@ Panel {
                     }
 
                     Button {
-                      visible: !!(root.sessionState && root.sessionState.loggedIn)
-                      text: strings.t("browser.logoutButton")
+                      visible: !!(root.sessionState && root.sessionState.loggedIn) || root.hasAuthToken || root.logoutInProgress
+                      enabled: !root.logoutInProgress
+                      text: root.logoutInProgress ? strings.t("browser.loggingOut") : strings.t("browser.logoutButton")
                       iconText: "\uf08b"
                       foreground: root.contentForeground
                       accent: root.urgentColor

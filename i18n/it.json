@@ -93,6 +93,7 @@
   "browser.loggingIn": "Accesso in corso...",
   "browser.syncNowButton": "Sincronizza ora",
   "browser.logoutButton": "Disconnetti",
+  "browser.loggingOut": "Disconnessione...",
   "browser.statusConnected": "Sessione attiva",
   "browser.greeting": "Ciao, %1",
   "browser.greetingShort": "Ciao!",

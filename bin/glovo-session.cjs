@@ -20,10 +20,13 @@ const SESSION_FILE = path.join(STATE_DIR, "session.json");
 const AUTH_FILE = path.join(STATE_DIR, "auth.json");
 const ORDER_FILE = path.join(STATE_DIR, "order.json");
 const LOCK_FILE = path.join(STATE_DIR, "session.lock");
+const LOGOUT_MARKER = path.join(STATE_DIR, "logout.pending");
 
 const ALLOWED_LANGS = new Set(["it", "en", "es", "fr", "de", "pt", "pl", "ro", "uk"]);
 const SYNC_TIMEOUT_MS = 22000;
 const LOGIN_TIMEOUT_MS = 300000;
+const LOGOUT_WAIT_MS = 6000;
+const MAX_CDP_BUFFER_BYTES = 4 * 1024 * 1024;
 
 function ensureStateDir() {
   fs.mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 });
@@ -90,6 +93,56 @@ function isPidAlive(pid) {
   }
 }
 
+function isGlovoSessionPid(pid) {
+  if (!Number.isInteger(pid) || pid <= 0 || pid === process.pid) return false;
+  if (!isPidAlive(pid)) return false;
+  try {
+    const cmdline = fs.readFileSync(`/proc/${pid}/cmdline`, "utf8").replace(/\0/g, " ");
+    return cmdline.includes("glovo-session.cjs");
+  } catch (_) {
+    return false;
+  }
+}
+
+function readPidFile(filePath) {
+  try {
+    const pid = parseInt(fs.readFileSync(filePath, "utf8").trim(), 10);
+    return Number.isInteger(pid) && pid > 0 ? pid : 0;
+  } catch (_) {
+    return 0;
+  }
+}
+
+function writeLogoutMarker() {
+  ensureStateDir();
+  const suffix = crypto.randomBytes(6).toString("hex");
+  const tmp = LOGOUT_MARKER + ".tmp." + process.pid + "." + suffix;
+  fs.writeFileSync(tmp, String(process.pid) + "\n", { mode: 0o600, flag: "wx" });
+  try { fs.chmodSync(tmp, 0o600); } catch (_) {}
+  fs.renameSync(tmp, LOGOUT_MARKER);
+}
+
+function clearLogoutMarker() {
+  try {
+    const owner = readPidFile(LOGOUT_MARKER);
+    if (owner === process.pid || (owner > 0 && !isPidAlive(owner))) {
+      fs.unlinkSync(LOGOUT_MARKER);
+    }
+  } catch (_) {}
+}
+
+function isLogoutRequested() {
+  if (!fs.existsSync(LOGOUT_MARKER)) return false;
+  const owner = readPidFile(LOGOUT_MARKER);
+  if (owner === process.pid || isGlovoSessionPid(owner)) return true;
+  // Clean up stale marker left by a crashed logout process
+  if (owner > 0 && !isPidAlive(owner)) {
+    try { fs.unlinkSync(LOGOUT_MARKER); } catch (_) {}
+    return false;
+  }
+  return true;
+}
+
 function acquireLock() {
   ensureStateDir();
   for (let attempt = 0; attempt < 2; attempt++) {
@@ -101,7 +154,7 @@ function acquireLock() {
     } catch (err) {
       if (err && err.code === "EEXIST") {
         try {
-          const existingPid = parseInt(fs.readFileSync(LOCK_FILE, "utf8").trim(), 10);
+          const existingPid = readPidFile(LOCK_FILE);
           if (!isPidAlive(existingPid)) {
             fs.unlinkSync(LOCK_FILE);
             continue;
@@ -117,7 +170,7 @@ function acquireLock() {
 
 function releaseLock() {
   try {
-    const owner = parseInt(fs.readFileSync(LOCK_FILE, "utf8").trim(), 10);
+    const owner = readPidFile(LOCK_FILE);
     if (owner === process.pid) fs.unlinkSync(LOCK_FILE);
   } catch (_) {}
 }
@@ -144,129 +197,150 @@ function notifyDesktop(headline, body, urgency = "low") {
   } catch (_) {}
 }
 
-function createCdpClient(wsUrl) {
-  return new Promise((resolve, reject) => {
-    const ws = new WebSocket(wsUrl);
-    let nextId = 1;
-    const pending = new Map();
-    const listeners = new Map();
+function createPipeCdpClient(proc) {
+  const pipeOut = proc && proc.stdio ? proc.stdio[3] : null;
+  const pipeIn = proc && proc.stdio ? proc.stdio[4] : null;
+  if (!pipeOut || !pipeIn) {
+    throw new Error("Chromium CDP pipe streams unavailable");
+  }
 
-    const openTimer = setTimeout(() => {
-      try { ws.close(); } catch (_) {}
-      reject(new Error("CDP connection timeout"));
-    }, 8000);
+  let nextId = 1;
+  let closed = false;
+  let rxBuf = Buffer.alloc(0);
+  const pending = new Map();
+  const listeners = new Map();
 
-    ws.addEventListener("open", () => {
-      clearTimeout(openTimer);
-      resolve({
-        send(method, params = {}, sessionId = undefined) {
-          return new Promise((res, rej) => {
-            const id = nextId++;
-            const timer = setTimeout(() => {
-              pending.delete(id);
-              rej(new Error(`CDP timeout for ${method}`));
-            }, 8000);
-            pending.set(id, { res, rej, timer });
-            const payload = { id, method, params };
-            if (sessionId) payload.sessionId = sessionId;
-            ws.send(JSON.stringify(payload));
-          });
-        },
-        on(eventName, handler) {
-          if (!listeners.has(eventName)) listeners.set(eventName, []);
-          listeners.get(eventName).push(handler);
-        },
-        close() {
-          for (const { rej, timer } of pending.values()) {
-            clearTimeout(timer);
-            rej(new Error("CDP closed"));
+  function failAll(err) {
+    if (closed) return;
+    closed = true;
+    for (const { rej, timer } of pending.values()) {
+      clearTimeout(timer);
+      rej(err);
+    }
+    pending.clear();
+  }
+
+  pipeOut.on("error", (err) => failAll(err instanceof Error ? err : new Error("CDP pipe write error")));
+  pipeIn.on("error", (err) => failAll(err instanceof Error ? err : new Error("CDP pipe read error")));
+  pipeIn.on("end", () => failAll(new Error("CDP pipe closed")));
+  proc.on("exit", (code) => failAll(new Error(`Chromium exited (${code})`)));
+  proc.on("error", (err) => failAll(err instanceof Error ? err : new Error("Chromium process error")));
+
+  pipeIn.on("data", (chunk) => {
+    if (closed) return;
+    rxBuf = rxBuf.length > 0 ? Buffer.concat([rxBuf, chunk]) : Buffer.from(chunk);
+    if (rxBuf.length > MAX_CDP_BUFFER_BYTES) {
+      failAll(new Error("CDP pipe message exceeded buffer limit"));
+      return;
+    }
+    let nulIdx = rxBuf.indexOf(0);
+    while (nulIdx !== -1) {
+      const raw = rxBuf.subarray(0, nulIdx).toString("utf8");
+      rxBuf = rxBuf.subarray(nulIdx + 1);
+      if (raw.length > 0) {
+        let msg;
+        try { msg = JSON.parse(raw); } catch (_) { msg = null; }
+        if (msg) {
+          if (msg.id !== undefined && pending.has(msg.id)) {
+            const entry = pending.get(msg.id);
+            pending.delete(msg.id);
+            clearTimeout(entry.timer);
+            if (msg.error) entry.rej(new Error(msg.error.message || "CDP error"));
+            else entry.res(msg.result || {});
+          } else if (msg.method && listeners.has(msg.method)) {
+            for (const fn of listeners.get(msg.method)) {
+              try { fn(msg.params || {}, msg.sessionId); } catch (_) {}
+            }
           }
-          pending.clear();
-          try { ws.close(); } catch (_) {}
+        }
+      }
+      nulIdx = rxBuf.indexOf(0);
+    }
+  });
+
+  return {
+    send(method, params = {}, sessionId = undefined) {
+      return new Promise((res, rej) => {
+        if (closed) {
+          rej(new Error("CDP pipe closed"));
+          return;
+        }
+        const id = nextId++;
+        const timer = setTimeout(() => {
+          pending.delete(id);
+          rej(new Error(`CDP timeout for ${method}`));
+        }, 8000);
+        pending.set(id, { res, rej, timer });
+        const payload = { id, method, params };
+        if (sessionId) payload.sessionId = sessionId;
+        try {
+          pipeOut.write(JSON.stringify(payload) + "\0");
+        } catch (err) {
+          clearTimeout(timer);
+          pending.delete(id);
+          rej(err instanceof Error ? err : new Error("CDP write failed"));
         }
       });
-    });
-
-    ws.addEventListener("message", (event) => {
-      let msg;
-      try { msg = JSON.parse(String(event.data || "")); } catch (_) { return; }
-      if (msg.id !== undefined && pending.has(msg.id)) {
-        const entry = pending.get(msg.id);
-        pending.delete(msg.id);
-        clearTimeout(entry.timer);
-        if (msg.error) entry.rej(new Error(msg.error.message || "CDP error"));
-        else entry.res(msg.result || {});
-        return;
-      }
-      if (msg.method && listeners.has(msg.method)) {
-        for (const fn of listeners.get(msg.method)) {
-          try { fn(msg.params || {}, msg.sessionId); } catch (_) {}
-        }
-      }
-    });
-
-    ws.addEventListener("error", (err) => {
-      clearTimeout(openTimer);
-      reject(err instanceof Error ? err : new Error("CDP WebSocket error"));
-    });
-  });
+    },
+    on(eventName, handler) {
+      if (!listeners.has(eventName)) listeners.set(eventName, []);
+      listeners.get(eventName).push(handler);
+    },
+    close() {
+      failAll(new Error("CDP closed"));
+      try { pipeOut.destroy(); } catch (_) {}
+      try { pipeIn.destroy(); } catch (_) {}
+    }
+  };
 }
 
-function launchChromium(args, startUrl) {
-  return new Promise((resolve, reject) => {
-    const finalArgs = startUrl ? [...args, startUrl] : [...args];
-    const proc = spawn("chromium", finalArgs, {
-      stdio: ["ignore", "pipe", "pipe"]
-    });
-    let stderrBuf = "";
-    let settled = false;
-
-    const bootTimer = setTimeout(() => {
-      if (!settled) {
-        settled = true;
-        try { proc.kill("SIGTERM"); } catch (_) {}
-        reject(new Error("Chromium CDP startup timeout"));
-      }
-    }, 10000);
-
-    proc.stderr.on("data", (chunk) => {
-      if (settled) return;
-      stderrBuf += chunk.toString();
-      if (stderrBuf.length > 32768) stderrBuf = stderrBuf.slice(-16384);
-      const match = /DevTools listening on (ws:\/\/127\.0\.0\.1:\d+\/devtools\/browser\/[^\s]+)/.exec(stderrBuf);
-      if (match) {
-        settled = true;
-        clearTimeout(bootTimer);
-        resolve({ proc, wsUrl: match[1] });
-      }
-    });
-
-    proc.on("exit", (code) => {
-      if (!settled) {
-        settled = true;
-        clearTimeout(bootTimer);
-        reject(new Error(`Chromium exited early with code ${code}`));
-      }
-    });
-
-    proc.on("error", (err) => {
-      if (!settled) {
-        settled = true;
-        clearTimeout(bootTimer);
-        reject(err);
-      }
-    });
+function launchChromiumPipe(args, startUrl) {
+  const finalArgs = startUrl ? [...args, startUrl] : [...args];
+  // Use inherited anonymous pipes (FD 3/4) via --remote-debugging-pipe so Chromium
+  // never opens any TCP listening port on loopback or any other interface.
+  const proc = spawn("chromium", finalArgs, {
+    stdio: ["ignore", "ignore", "ignore", "pipe", "pipe"]
   });
+  const cdp = createPipeCdpClient(proc);
+  return { proc, cdp };
 }
 
 function stopChromium(proc) {
-  if (!proc || proc.killed) return;
+  if (!proc || proc.killed || proc.exitCode !== null) return;
   try { proc.kill("SIGTERM"); } catch (_) {}
   setTimeout(() => {
     try {
       if (proc.exitCode === null) proc.kill("SIGKILL");
     } catch (_) {}
   }, 1500).unref();
+}
+
+function stopChromiumAndWait(proc, timeoutMs = 2000) {
+  return new Promise((resolve) => {
+    if (!proc || proc.exitCode !== null || proc.signalCode !== null) {
+      resolve();
+      return;
+    }
+    let done = false;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      clearTimeout(killTimer);
+      clearTimeout(giveUpTimer);
+      resolve();
+    };
+    proc.once("exit", finish);
+    proc.once("close", finish);
+    try { proc.kill("SIGTERM"); } catch (_) { finish(); return; }
+    const killTimer = setTimeout(() => {
+      try {
+        if (proc.exitCode === null && proc.signalCode === null) proc.kill("SIGKILL");
+      } catch (_) {}
+    }, Math.min(1200, Math.floor(timeoutMs * 0.6)));
+    killTimer.unref();
+    const giveUpTimer = setTimeout(finish, timeoutMs);
+    giveUpTimer.unref();
+  });
 }
 
 function saveTokenAndSession(token, reason = "", userName = "") {
@@ -332,8 +406,22 @@ async function fetchGlovoUserName(token, lang) {
   }
 }
 
-function delay(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+function delay(ms, signal) {
+  return new Promise((resolve) => {
+    if (signal && signal.aborted) {
+      resolve();
+      return;
+    }
+    const timer = setTimeout(() => {
+      if (signal) signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    function onAbort() {
+      clearTimeout(timer);
+      resolve();
+    }
+    if (signal) signal.addEventListener("abort", onAbort, { once: true });
+  });
 }
 
 function isAllowedGlovoUrl(urlStr) {
@@ -342,10 +430,7 @@ function isAllowedGlovoUrl(urlStr) {
 }
 
 async function runSync(lang) {
-  if (!fs.existsSync(PROFILE_DIR)) {
-    saveTokenAndSession("", "profile_missing");
-    return;
-  }
+  if (isLogoutRequested()) return;
   if (!acquireLock()) {
     process.stderr.write("glovo-session: sync skipped (lock held)\n");
     return;
@@ -353,26 +438,44 @@ async function runSync(lang) {
 
   let proc = null;
   let cdp = null;
-  const hardTimer = setTimeout(() => {
+  const abortController = new AbortController();
+  const isAborted = () => abortController.signal.aborted || isLogoutRequested();
+
+  const onSignal = () => {
+    abortController.abort();
     if (cdp) cdp.close();
     stopChromium(proc);
-    releaseLock();
-    process.exit(1);
+  };
+  process.on("SIGTERM", onSignal);
+  process.on("SIGINT", onSignal);
+
+  const hardTimer = setTimeout(() => {
+    abortController.abort();
+    if (cdp) cdp.close();
+    stopChromium(proc);
   }, SYNC_TIMEOUT_MS);
 
   try {
+    if (isAborted()) return;
+    if (!fs.existsSync(PROFILE_DIR)) {
+      const existingSess = readJsonSafe(SESSION_FILE);
+      if (existingSess && existingSess.loggedIn) {
+        saveTokenAndSession("", "profile_missing");
+      }
+      return;
+    }
+
     const startUrl = `https://glovoapp.com/${lang}/profile/orders`;
-    const launched = await launchChromium([
+    const launched = launchChromiumPipe([
       "--headless=new",
       `--user-data-dir=${PROFILE_DIR}`,
-      "--remote-debugging-port=0",
-      "--remote-debugging-address=127.0.0.1",
+      "--remote-debugging-pipe",
       "--no-first-run",
       "--disable-default-apps",
       "--disable-background-networking"
     ], "about:blank");
     proc = launched.proc;
-    cdp = await createCdpClient(launched.wsUrl);
+    cdp = launched.cdp;
 
     const { targetId } = await cdp.send("Target.createTarget", { url: "about:blank" });
     const { sessionId } = await cdp.send("Target.attachToTarget", { targetId, flatten: true });
@@ -413,8 +516,10 @@ async function runSync(lang) {
     });
 
     await cdp.send("Page.navigate", { url: startUrl }, sessionId);
-    await delay(4500);
+    await delay(4500, abortController.signal);
+    if (isAborted()) return;
     await Promise.allSettled(inflightBodies.splice(0, inflightBodies.length));
+    if (isAborted()) return;
 
     // Check cookies from browser profile (Chromium auto-refreshes HttpOnly glov... cookie)
     const cookieRes = await cdp.send("Storage.getCookies", {}, sessionId);
@@ -434,6 +539,7 @@ async function runSync(lang) {
       })()`,
       returnByValue: true
     }, sessionId);
+    if (isAborted()) return;
 
     const pageInfo = (pageInfoRes && pageInfoRes.result && pageInfoRes.result.value) || {};
     const pageTextLower = String(pageInfo.text || "").toLowerCase();
@@ -444,7 +550,9 @@ async function runSync(lang) {
     );
 
     if (!token || blockedOrLoggedOut) {
-      saveTokenAndSession("", blockedOrLoggedOut ? "needs_login" : "no_cookie");
+      if (!isAborted()) {
+        saveTokenAndSession("", blockedOrLoggedOut ? "needs_login" : "no_cookie");
+      }
       return;
     }
 
@@ -462,6 +570,7 @@ async function runSync(lang) {
         : await fetchGlovoUserName(token, lang);
     }
 
+    if (isAborted()) return;
     saveTokenAndSession(token, "", userName);
 
     // 1. Check captured api.glovoapp.com JSON payloads first
@@ -476,15 +585,17 @@ async function runSync(lang) {
     }
 
     // 2. If there is a dedicated active-order tracking link on /profile/orders, visit it once
-    if (!activeOrder && Array.isArray(pageInfo.links) && pageInfo.links.length > 0) {
+    if (!activeOrder && !isAborted() && Array.isArray(pageInfo.links) && pageInfo.links.length > 0) {
       const candidate = String(pageInfo.links[0] || "");
       const targetUrl = candidate.startsWith("/")
         ? "https://glovoapp.com" + candidate
         : candidate;
       if (isAllowedGlovoUrl(targetUrl)) {
         await cdp.send("Page.navigate", { url: targetUrl }, sessionId);
-        await delay(3500);
+        await delay(3500, abortController.signal);
+        if (isAborted()) return;
         await Promise.allSettled(inflightBodies.splice(0, inflightBodies.length));
+        if (isAborted()) return;
         for (const item of capturedJsonBodies) {
           const parsed = Model.parseGlovoResponse(item.body, Date.now());
           if (parsed && parsed.hasOrder) {
@@ -513,6 +624,7 @@ async function runSync(lang) {
       if (domParsed && domParsed.hasOrder) activeOrder = domParsed;
     }
 
+    if (isAborted()) return;
     if (activeOrder && activeOrder.hasOrder) {
       atomicWriteJson(ORDER_FILE, activeOrder);
     } else {
@@ -526,15 +638,23 @@ async function runSync(lang) {
         });
       }
     }
+  } catch (err) {
+    if (!isAborted()) throw err;
   } finally {
     clearTimeout(hardTimer);
+    process.off("SIGTERM", onSignal);
+    process.off("SIGINT", onSignal);
     if (cdp) cdp.close();
-    stopChromium(proc);
+    await stopChromiumAndWait(proc, 2000);
     releaseLock();
   }
 }
 
 async function runLogin(lang) {
+  if (isLogoutRequested()) {
+    process.stderr.write("glovo-session: logout in progress\n");
+    process.exit(1);
+  }
   ensureProfileDir();
   if (!acquireLock()) {
     process.stderr.write("glovo-session: another session action is running\n");
@@ -542,6 +662,14 @@ async function runLogin(lang) {
   }
 
   let proc = null;
+  let aborted = false;
+
+  const onSignal = () => {
+    aborted = true;
+    stopChromium(proc);
+  };
+  process.on("SIGTERM", onSignal);
+  process.on("SIGINT", onSignal);
 
   const loginTimer = setTimeout(() => {
     stopChromium(proc);
@@ -549,7 +677,7 @@ async function runLogin(lang) {
 
   try {
     const startUrl = `https://glovoapp.com/${lang}/${lang}`;
-    // Launch clean Chromium without --remote-debugging-port so Google OAuth
+    // Launch clean Chromium without remote debugging flags so Google OAuth
     // does not flag the interactive login window as automated/debugging.
     await new Promise((resolve, reject) => {
       proc = spawn("chromium", [
@@ -565,11 +693,16 @@ async function runLogin(lang) {
     });
   } finally {
     clearTimeout(loginTimer);
-    stopChromium(proc);
+    process.off("SIGTERM", onSignal);
+    process.off("SIGINT", onSignal);
+    await stopChromiumAndWait(proc, 2000);
     releaseLock();
   }
 
+  if (aborted || isLogoutRequested()) return;
+
   await runSync(lang);
+  if (aborted || isLogoutRequested()) return;
   const sess = readJsonSafe(SESSION_FILE);
   if (sess && sess.loggedIn) {
     const greeting = sess.userName
@@ -584,13 +717,41 @@ async function runLogin(lang) {
   }
 }
 
-function runLogout() {
-  if (!acquireLock()) {
-    process.stderr.write("glovo-session: lock held\n");
-    process.exit(1);
-  }
+async function runLogout() {
+  writeLogoutMarker();
+  let lockAcquired = false;
   try {
+    const startMs = Date.now();
+    const signaled = new Set();
+    const killed = new Set();
+
+    while (Date.now() - startMs < LOGOUT_WAIT_MS) {
+      if (acquireLock()) {
+        lockAcquired = true;
+        break;
+      }
+      const holderPid = readPidFile(LOCK_FILE);
+      if (holderPid > 0 && isGlovoSessionPid(holderPid)) {
+        const elapsed = Date.now() - startMs;
+        if (!signaled.has(holderPid)) {
+          signaled.add(holderPid);
+          try { process.kill(holderPid, "SIGTERM"); } catch (_) {}
+        } else if (elapsed >= 3000 && !killed.has(holderPid)) {
+          killed.add(holderPid);
+          try { process.kill(holderPid, "SIGKILL"); } catch (_) {}
+        }
+      }
+      await delay(100);
+    }
+
+    if (!lockAcquired) {
+      throw new Error("could not acquire session lock for logout");
+    }
+
     fs.rmSync(PROFILE_DIR, { recursive: true, force: true });
+    if (fs.existsSync(PROFILE_DIR)) {
+      throw new Error("Failed to remove browser profile directory");
+    }
     atomicWriteJson(AUTH_FILE, { token: "", orderId: "" });
     atomicWriteJson(SESSION_FILE, {
       loggedIn: false,
@@ -611,7 +772,8 @@ function runLogout() {
       });
     }
   } finally {
-    releaseLock();
+    if (lockAcquired) releaseLock();
+    clearLogoutMarker();
   }
 }
 
@@ -645,6 +807,9 @@ async function runSaveAuth() {
 }
 
 async function runFetchApi(lang, mode, orderIdArg) {
+  if (isLogoutRequested()) {
+    process.exit(1);
+  }
   const auth = readJsonSafe(AUTH_FILE);
   const token = Model.sanitizeToken(auth && auth.token ? auth.token : "");
   if (!token || typeof fetch !== "function") {
@@ -676,6 +841,9 @@ async function runFetchApi(lang, mode, orderIdArg) {
     process.exit(1);
   }
   const text = await readBoundedText(res, Model.MAX_RESPONSE_BYTES);
+  if (isLogoutRequested()) {
+    process.exit(1);
+  }
   process.stdout.write(text);
 }
 
@@ -688,7 +856,7 @@ async function main() {
   } else if (cmd === "sync") {
     await runSync(lang);
   } else if (cmd === "logout") {
-    runLogout();
+    await runLogout();
   } else if (cmd === "save-auth") {
     await runSaveAuth();
   } else if (cmd === "fetch-api") {
@@ -710,5 +878,6 @@ if (require.main === module) {
 
 module.exports = {
   cleanLang,
-  isAllowedGlovoUrl
+  isAllowedGlovoUrl,
+  createPipeCdpClient
 };

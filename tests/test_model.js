@@ -3,10 +3,12 @@
 "use strict";
 
 const assert = require("assert");
-const { execFileSync } = require("child_process");
+const { execFileSync, spawn } = require("child_process");
+const EventEmitter = require("events");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
+const { PassThrough } = require("stream");
 
 const Model = require(path.resolve(__dirname, "..", "Model.js"));
 const GlovoSession = require(path.resolve(__dirname, "..", "bin", "glovo-session.cjs"));
@@ -466,9 +468,135 @@ const NOW = new Date(2026, 10, 16, 13, 41, 0, 0).getTime();
       oversizedFailed = true;
     }
     assert.strictEqual(oversizedFailed, true);
+
+    // Verify glovo-session.cjs uses --remote-debugging-pipe and never opens a TCP debugging port
+    const sessionSrc = fs.readFileSync(scriptPath, "utf8");
+    assert.strictEqual(sessionSrc.includes("--remote-debugging-pipe"), true);
+    assert.strictEqual(sessionSrc.includes("--remote-debugging-port"), false);
   } finally {
     fs.rmSync(tmpState, { recursive: true, force: true });
   }
 }
 
-console.log("All glovo-tracker model & security tests passed.");
+// 8. Async tests: pipe CDP framing & preemptive logout while sync holds the lock
+(async () => {
+  // 8a. createPipeCdpClient NUL-delimited framing, chunk splitting, and event dispatch
+  const fakeProc = new EventEmitter();
+  const pipeToBrowser = new PassThrough();
+  const pipeFromBrowser = new PassThrough();
+  fakeProc.stdio = [null, null, null, pipeToBrowser, pipeFromBrowser];
+
+  const cdp = GlovoSession.createPipeCdpClient(fakeProc);
+  const receivedEvents = [];
+  cdp.on("Network.responseReceived", (params, sid) => receivedEvents.push({ params, sid }));
+
+  let written = "";
+  pipeToBrowser.on("data", (c) => { written += c.toString("utf8"); });
+  const versionPromise = cdp.send("Browser.getVersion", {}, "sess-1");
+
+  // Feed split chunks containing an event + command response separated by NUL bytes
+  const evtFrame = JSON.stringify({ method: "Network.responseReceived", sessionId: "sess-1", params: { requestId: "r1" } }) + "\0";
+  const resFrame = JSON.stringify({ id: 1, result: { product: "HeadlessChrome/test" } }) + "\0";
+  const combined = Buffer.from(evtFrame + resFrame, "utf8");
+  pipeFromBrowser.write(combined.subarray(0, 17));
+  pipeFromBrowser.write(combined.subarray(17));
+
+  const versionRes = await versionPromise;
+  assert.strictEqual(versionRes.product, "HeadlessChrome/test");
+  assert.strictEqual(receivedEvents.length, 1);
+  assert.strictEqual(receivedEvents[0].params.requestId, "r1");
+  assert.strictEqual(receivedEvents[0].sid, "sess-1");
+  assert.ok(written.endsWith("\0"));
+  assert.strictEqual(JSON.parse(written.slice(0, -1)).method, "Browser.getVersion");
+  cdp.close();
+
+  // 8b. Preemptive sign out succeeds while a concurrent sync holds session.lock
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "glovo-logout-race-"));
+  const tmpState = path.join(tmpRoot, "state");
+  const fakeBin = path.join(tmpRoot, "bin");
+  const stateDir = path.join(tmpState, "omarchy", "glovo-tracker");
+  const profileDir = path.join(stateDir, "browser-profile");
+  const scriptPath = path.resolve(__dirname, "..", "bin", "glovo-session.cjs");
+  let syncProc = null;
+  let blockerProc = null;
+
+  try {
+    fs.mkdirSync(fakeBin, { recursive: true, mode: 0o700 });
+    fs.mkdirSync(profileDir, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(path.join(profileDir, "Cookies"), "secret-cookie-data", { mode: 0o600 });
+    fs.writeFileSync(path.join(stateDir, "auth.json"), JSON.stringify({ token: "secret_tok", orderId: "ORD1" }), { mode: 0o600 });
+    fs.writeFileSync(path.join(stateDir, "session.json"), JSON.stringify({ loggedIn: true, status: "connected", userName: "Alex" }), { mode: 0o600 });
+    fs.writeFileSync(path.join(stateDir, "order.json"), JSON.stringify({ hasOrder: true, stage: "preparing", source: "browser", storeName: "Bistro" }), { mode: 0o600 });
+
+    // Mock chromium that records its argv (confirming --remote-debugging-pipe) and stays open until terminated
+    const argsLog = path.join(tmpRoot, "chromium-args.txt");
+    const fakeChromium = path.join(fakeBin, "chromium");
+    fs.writeFileSync(fakeChromium, `#!/usr/bin/env node
+const fs = require("fs");
+fs.writeFileSync(${JSON.stringify(argsLog)}, JSON.stringify(process.argv.slice(2)));
+setInterval(() => {}, 1000);
+`, { mode: 0o755 });
+
+    const env = {
+      ...process.env,
+      XDG_STATE_HOME: tmpState,
+      PATH: `${fakeBin}:${process.env.PATH || ""}`
+    };
+
+    syncProc = spawn(process.execPath, [scriptPath, "sync", "it"], { env, stdio: "ignore" });
+
+    // Wait until sync acquires session.lock and spawns mock chromium
+    const lockFile = path.join(stateDir, "session.lock");
+    for (let i = 0; i < 60; i++) {
+      if (fs.existsSync(lockFile) && fs.existsSync(argsLog)) break;
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    assert.strictEqual(fs.existsSync(lockFile), true, "sync should hold session.lock");
+    const launchedArgs = JSON.parse(fs.readFileSync(argsLog, "utf8"));
+    assert.strictEqual(launchedArgs.includes("--remote-debugging-pipe"), true, "chromium must use --remote-debugging-pipe");
+    assert.strictEqual(launchedArgs.some((a) => a.startsWith("--remote-debugging-port")), false, "chromium must never pass --remote-debugging-port");
+
+    // Trigger logout WHILE sync holds the lock
+    execFileSync(process.execPath, [scriptPath, "logout", "it"], { env, timeout: 8000 });
+
+    // Wait briefly for sync process exit and ensure it cannot rewrite credentials
+    await new Promise((resolve) => {
+      if (syncProc.exitCode !== null || syncProc.signalCode !== null) return resolve();
+      syncProc.once("exit", resolve);
+      setTimeout(resolve, 2000);
+    });
+    assert.notStrictEqual(syncProc.exitCode === null && syncProc.signalCode === null, true, "sync should be terminated by logout");
+    assert.strictEqual(fs.existsSync(profileDir), false, "browser-profile must be deleted after logout");
+    const authAfter = JSON.parse(fs.readFileSync(path.join(stateDir, "auth.json"), "utf8"));
+    const sessAfter = JSON.parse(fs.readFileSync(path.join(stateDir, "session.json"), "utf8"));
+    const orderAfter = JSON.parse(fs.readFileSync(path.join(stateDir, "order.json"), "utf8"));
+    assert.strictEqual(authAfter.token, "");
+    assert.strictEqual(sessAfter.loggedIn, false);
+    assert.strictEqual(sessAfter.status, "logged_out");
+    assert.strictEqual(orderAfter.hasOrder, false);
+    assert.strictEqual(fs.existsSync(lockFile), false, "session.lock should be released");
+    assert.strictEqual(fs.existsSync(path.join(stateDir, "logout.pending")), false, "logout.pending should be cleaned up");
+
+    // 8c. Verify logout refuses to signal an unrelated PID holding session.lock and fails non-zero
+    blockerProc = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+    fs.writeFileSync(lockFile, String(blockerProc.pid), { mode: 0o600 });
+    let logoutFailed = false;
+    try {
+      execFileSync(process.execPath, [scriptPath, "logout", "it"], { env, timeout: 9000, stdio: "pipe" });
+    } catch (_) {
+      logoutFailed = true;
+    }
+    assert.strictEqual(logoutFailed, true, "logout must fail non-zero if an unrelated PID holds the lock");
+    assert.strictEqual(blockerProc.exitCode, null, "logout must never kill an unrelated PID");
+    assert.strictEqual(fs.existsSync(path.join(stateDir, "logout.pending")), false, "logout.pending cleaned up on failure");
+  } finally {
+    if (syncProc && syncProc.exitCode === null) try { syncProc.kill("SIGKILL"); } catch (_) {}
+    if (blockerProc && blockerProc.exitCode === null) try { blockerProc.kill("SIGKILL"); } catch (_) {}
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+
+  console.log("All glovo-tracker model & security tests passed.");
+})().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});

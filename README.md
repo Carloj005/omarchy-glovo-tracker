@@ -36,8 +36,8 @@ rm -rf ~/.local/state/omarchy/glovo-tracker
 
 All required tools run with normal user permissions; no privilege elevation is required.
 
-- **Node.js 22+ (`node`)**: runs `bin/glovo-session.cjs` using built-in `WebSocket` and `fetch` (no npm packages required).
-- **Chromium (`chromium`)**: required only for the optional standalone PC browser login and headless background sync.
+- **Node.js 22+ (`node`)**: runs `bin/glovo-session.cjs` using built-in `fetch` and anonymous pipe IPC (no npm packages required).
+- **Chromium (`chromium`)**: required only for the optional standalone PC browser login and headless background sync (communicates over private anonymous pipes via `--remote-debugging-pipe`, with no TCP ports opened).
 - **`paplay`** (PulseAudio / PipeWire): plays the bundled `.oga` stage notification chimes.
 - **`omarchy-notification-send`**: ships with Omarchy for desktop notifications.
 - **Flux (`fluxd`)** *(optional)*: only needed if you enable phone notification sync.
@@ -68,7 +68,9 @@ omarchy-shell io.github.carloj005.glovo-tracker testSound sequence
 ## Privacy & Security
 
 - **Explicit network endpoints**: network requests are restricted to `https://glovoapp.com` and `https://api.glovoapp.com` with strict timeouts and response-size caps (`256 KiB`).
+- **No local TCP debugging ports**: headless browser sync communicates with Chromium strictly via inherited anonymous pipes (`--remote-debugging-pipe`), never opening a loopback or network TCP listener.
 - **No tokens in process arguments**: credentials are delivered over `stdin` when saved and read directly from the `0600` `auth.json` file during API requests, never passed via command-line arguments (`/proc/<pid>/cmdline`).
+- **Preemptive sign out**: signing out immediately cancels active sync/polling, preempts any in-flight `glovo-session.cjs` lock holder, disables background sync/polling, and removes the saved profile and token (surfacing an explicit UI error if sign out fails).
 - **Opt-in background sync**: both automatic browser session sync (`browserSyncEnabled`) and API polling (`autoRefreshEnabled`) are disabled by default and clearly disclosed in Settings.
 - **Owner-only atomic local state**: credentials, session state, and the isolated Chromium profile live in `~/.local/state/omarchy/glovo-tracker/` (`0700` directory, atomic `0600` files created with `O_EXCL`).
 - **Untrusted input hardening**: all external text is neutralized against HTML/QML markup and rendered through `Text.PlainText` (`PlainText.qml`).

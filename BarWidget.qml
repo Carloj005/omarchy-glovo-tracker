@@ -53,6 +53,7 @@ BarWidget {
   property bool fetching: false
   property bool browserSyncing: false
   property bool loginInProgress: false
+  property bool logoutInProgress: false
   property bool startupSyncChecked: false
   property string lastError: ""
   property bool fluxConnected: false
@@ -144,6 +145,7 @@ BarWidget {
     if ("fetching" in target) target.fetching = root.fetching
     if ("browserSyncing" in target) target.browserSyncing = root.browserSyncing
     if ("loginInProgress" in target) target.loginInProgress = root.loginInProgress
+    if ("logoutInProgress" in target) target.logoutInProgress = root.logoutInProgress
     if ("sessionState" in target) target.sessionState = root.sessionState
     if ("lastError" in target) target.lastError = root.lastError
     if ("hasAuthToken" in target) target.hasAuthToken = root.hasAuthToken
@@ -157,6 +159,7 @@ BarWidget {
   onFetchingChanged: if (panelLoader.item && "fetching" in panelLoader.item) panelLoader.item.fetching = root.fetching
   onBrowserSyncingChanged: if (panelLoader.item && "browserSyncing" in panelLoader.item) panelLoader.item.browserSyncing = root.browserSyncing
   onLoginInProgressChanged: if (panelLoader.item && "loginInProgress" in panelLoader.item) panelLoader.item.loginInProgress = root.loginInProgress
+  onLogoutInProgressChanged: if (panelLoader.item && "logoutInProgress" in panelLoader.item) panelLoader.item.logoutInProgress = root.logoutInProgress
   onSessionStateChanged: if (panelLoader.item && "sessionState" in panelLoader.item) panelLoader.item.sessionState = root.sessionState
   onLastErrorChanged: if (panelLoader.item && "lastError" in panelLoader.item) panelLoader.item.lastError = root.lastError
   onHasAuthTokenChanged: if (panelLoader.item && "hasAuthToken" in panelLoader.item) panelLoader.item.hasAuthToken = root.hasAuthToken
@@ -280,7 +283,7 @@ BarWidget {
   }
 
   function loginBrowser() {
-    if (loginProc.running || root.loginInProgress) return
+    if (loginProc.running || root.loginInProgress || root.logoutInProgress) return
     root.lastError = ""
     root.loginInProgress = true
     loginProc.command = ["node", root.sessionScriptPath, "login", root.currentLangCode()]
@@ -288,7 +291,7 @@ BarWidget {
   }
 
   function syncBrowserSession() {
-    if (browserSyncProc.running || root.browserSyncing || root.loginInProgress) return
+    if (browserSyncProc.running || root.browserSyncing || root.loginInProgress || root.logoutInProgress) return
     root.lastError = ""
     root.browserSyncing = true
     browserSyncProc.command = ["node", root.sessionScriptPath, "sync", root.currentLangCode()]
@@ -296,12 +299,28 @@ BarWidget {
   }
 
   function logoutBrowser() {
-    if (logoutProc.running) return
+    if (logoutProc.running || root.logoutInProgress) return
+    root.lastError = ""
+    root.logoutInProgress = true
+    startupSyncTimer.stop()
+    if (browserSyncProc.running) {
+      browserSyncProc.running = false
+      root.browserSyncing = false
+    }
+    if (loginProc.running) {
+      loginProc.running = false
+      root.loginInProgress = false
+    }
+    if (apiProc.running) {
+      apiProc.running = false
+      root.fetching = false
+    }
     logoutProc.command = ["node", root.sessionScriptPath, "logout", root.currentLangCode()]
     logoutProc.running = true
   }
 
   function refresh() {
+    if (root.logoutInProgress) return
     authFile.reload()
     sessionFile.reload()
     if (root.demoActive) {
@@ -322,7 +341,7 @@ BarWidget {
   }
 
   function fetchFromGlovoApi(useWhatsUpFallback) {
-    if (!root.hasAuthToken || root.fetching) return
+    if (!root.hasAuthToken || root.fetching || root.logoutInProgress) return
     var tryingFallback = (useWhatsUpFallback === true)
     var lang = root.currentLangCode()
     apiProc.usingWhatsUpFallback = tryingFallback
@@ -525,7 +544,7 @@ BarWidget {
     onLoadFailed: root.authState = ({ token: "", orderId: "" })
   }
 
-  // Dedicated browser session processes (Option B)
+  // Dedicated browser session processes
   Process {
     id: loginProc
     onExited: function(exitCode) {
@@ -533,7 +552,7 @@ BarWidget {
       sessionFile.reload()
       authFile.reload()
       orderFile.reload()
-      if (exitCode !== 0) {
+      if (!root.logoutInProgress && exitCode !== 0) {
         root.lastError = "Login exited (" + exitCode + ")"
       }
     }
@@ -546,7 +565,7 @@ BarWidget {
       sessionFile.reload()
       authFile.reload()
       orderFile.reload()
-      if (exitCode !== 0) {
+      if (!root.logoutInProgress && exitCode !== 0) {
         root.lastError = "Browser sync (" + exitCode + ")"
       }
     }
@@ -554,10 +573,27 @@ BarWidget {
 
   Process {
     id: logoutProc
-    onExited: function() {
+    onExited: function(exitCode) {
+      root.logoutInProgress = false
       sessionFile.reload()
       authFile.reload()
       orderFile.reload()
+      if (exitCode !== 0) {
+        root.lastError = "Logout failed (" + exitCode + ")"
+        return
+      }
+      root.authState = ({ token: "", orderId: "" })
+      root.sessionState = Model.parseSessionFile("")
+      if (root.currentOrder && (root.currentOrder.source === "browser" || root.currentOrder.source === "api")) {
+        root.currentOrder = Model.emptyOrder()
+      }
+      if ((root.browserSyncEnabled || root.autoRefreshEnabled) && panelLoader.item && panelLoader.item.persistSettings) {
+        panelLoader.item.persistSettings({
+          browserSyncEnabled: false,
+          autoRefreshEnabled: false
+        })
+      }
+      root.lastError = ""
     }
   }
 
@@ -591,6 +627,7 @@ BarWidget {
       id: apiStdout
       onStreamFinished: {
         root.fetching = false
+        if (root.logoutInProgress || !root.hasAuthToken) return
         var raw = String(apiStdout.text || "")
         var parsed = Model.parseGlovoResponse(raw, Date.now())
         if (parsed) {
@@ -603,6 +640,7 @@ BarWidget {
     }
     onExited: function(exitCode) {
       root.fetching = false
+      if (root.logoutInProgress) return
       if (exitCode !== 0) {
         if (apiProc.canFallbackToWhatsUp) {
           apiProc.canFallbackToWhatsUp = false
@@ -620,7 +658,7 @@ BarWidget {
     interval: 3000
     repeat: false
     onTriggered: {
-      if (root.browserSyncEnabled && root.sessionState && root.sessionState.loggedIn && !root.demoActive) {
+      if (root.browserSyncEnabled && root.sessionState && root.sessionState.loggedIn && !root.demoActive && !root.logoutInProgress) {
         root.syncBrowserSession()
       }
     }
@@ -631,7 +669,7 @@ BarWidget {
     id: browserSyncTimer
     interval: root.browserPollIntervalMinutes * 60000
     repeat: true
-    running: root.browserSyncEnabled && root.sessionState && root.sessionState.loggedIn && !root.demoActive && !root.loginInProgress
+    running: root.browserSyncEnabled && root.sessionState && root.sessionState.loggedIn && !root.demoActive && !root.loginInProgress && !root.logoutInProgress
     onTriggered: root.syncBrowserSession()
   }
 
@@ -640,7 +678,7 @@ BarWidget {
     id: pollTimer
     interval: root.pollIntervalMinutes * 60000
     repeat: true
-    running: root.autoRefreshEnabled && root.hasAuthToken && !root.demoActive && !(root.browserSyncEnabled && root.sessionState && root.sessionState.loggedIn)
+    running: root.autoRefreshEnabled && root.hasAuthToken && !root.demoActive && !root.logoutInProgress && !(root.browserSyncEnabled && root.sessionState && root.sessionState.loggedIn)
     onTriggered: root.fetchFromGlovoApi(false)
   }
 

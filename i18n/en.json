@@ -93,6 +93,7 @@
   "browser.loggingIn": "Waiting for login...",
   "browser.syncNowButton": "Sync now",
   "browser.logoutButton": "Sign out",
+  "browser.loggingOut": "Signing out...",
   "browser.statusConnected": "Session active",
   "browser.greeting": "Hi, %1",
   "browser.greetingShort": "Hi!",
