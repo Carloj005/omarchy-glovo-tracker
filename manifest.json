@@ -16,7 +16,7 @@
     "displayName": "Glovo Tracker",
     "description": "Glovo order status pill with live ETA window and phone-style delivery popup",
     "category": "Info",
-    "defaultSection": "centerEnd",
+    "defaultSection": "right",
     "allowMultiple": false,
     "defaults": {
       "browserSyncEnabled": false,
