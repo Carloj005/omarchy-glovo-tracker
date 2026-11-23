@@ -1,0 +1,35 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.carloj005.glovo-tracker",
+  "name": "Glovo Tracker",
+  "version": "1.2.0",
+  "author": "Carloj005",
+  "license": "MIT",
+  "description": "Track Glovo delivery orders from the Omarchy bar with live ETA window, route map, progressive stage chimes, standalone PC browser sync, and Flux phone sync.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Glovo Tracker",
+    "description": "Glovo order status pill with live ETA window and phone-style delivery popup",
+    "category": "Info",
+    "defaultSection": "centerEnd",
+    "allowMultiple": false,
+    "defaults": {
+      "browserSyncEnabled": false,
+      "browserPollIntervalMinutes": 2,
+      "autoRefreshEnabled": false,
+      "syncFromPhoneEnabled": true,
+      "pollIntervalMinutes": 2,
+      "notifyOnStageChange": true,
+      "notifyOnEtaChange": true,
+      "soundEnabled": true,
+      "showEtaInBar": true,
+      "hideWhenIdle": false,
+      "orderId": ""
+    }
+  }
+}
